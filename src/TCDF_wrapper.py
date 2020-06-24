@@ -39,7 +39,7 @@ class TCDF():
     kernel_size : int
         Size of kernel, i.e. window size.
         Maximum delay to be found is kernel size - 1.
-        Recommended to be equal to dilation coeffient
+        Recommended to be equal to dilation coefficient
     hidden_layers : int
         Number of hidden layers in the depthwise convolution
     dilation_coefficient : int
@@ -56,8 +56,6 @@ class TCDF():
         Epoch interval to report loss
     seed : int
         Random seed
-    plot : bool
-        Show causal graph
     """
     def __init__(self,
                  cuda=False,
@@ -78,13 +76,18 @@ class TCDF():
         if kernel_size != dilation_coefficient:
             print('WARNING: The dilation coefficient is not equal to the kernel size.\n\
                    Multiple paths can lead to the same delays.\n\
-                   Set kernel_size equal to dilation_c to have exaxtly one path for each delay.')
+                   Set kernel_size equal to dilation_c to have exactly one path for each delay.')
+        
+        receptive_field = 1
+        for level in range(0, hidden_layers + 1):
+            receptive_field += (kernel_size - 1) * dilation_coefficient**(level)
         
         self.cnn_parameters = {'cuda': cuda,
                                'num_epochs': epochs,
                                'kernel_size': kernel_size,
                                'levels': hidden_layers + 1,
                                'dilation_c': dilation_coefficient,
+                               'receptive_field': receptive_field,
                                'significance': significance,
                                'learning_rate': learning_rate,
                                'optimizer': optimizer,
@@ -93,14 +96,14 @@ class TCDF():
         self.models = None
         self.verbose = None
     
-    def fit(self, X, verbose=None):
+    def fit(self, X_path, verbose=None):
         """Loops through all variables in a dataset and return the discovered
         causes, time delays, losses, attention scores and variable names."""
         self.models = {}
         if verbose is not None:
             self.verbose = verbose
         
-        dataframe = pd.read_csv(X)
+        dataframe = pd.read_csv(X_path)
 
         self.causes = dict()
         self.delays = dict()
@@ -306,164 +309,174 @@ class TCDF():
                   + f'with a delay of {self.delays[pair]} time steps.')
         print('\n============================================================\n')
 
-    def check_with_ground_truth(self, y):
+    def check_with_ground_truth(self, y_path):
         """Evaluate TCDF by comparing discovered causes with ground truth"""
+        dataframe = pd.read_csv(y_path, header=None)
 
-        receptivefield = 1
-        for level in range(0, self.cnn_parameters['levels']):
-            receptivefield += (self.cnn_parameters['kernel_size'] - 1) \
-                              * self.cnn_parameters['dilation_c']**(level)
-        
         print('\n======================== EVALUATION ========================\n')
-        FP, TP, FPdirect, TPdirect, FN, FPs, FPsdirect, TPs, TPsdirect, FNs, F1, F1direct = \
-            self._evaluate(y)
+        self.stats = self._calculate_stats(dataframe)
+        
+        print('⎡ Counts')
+        print('|')
+        print(f"| True Positives: {self.stats['num_true_positives']}")
+        print(f"| False Positives: {self.stats['num_false_positives']}")
+        print(f"| False Negatives: {self.stats['num_false_negatives']}")
+        print(f"| Direct True Positives: {self.stats['num_true_positives_direct']}")
+        print(f"⎣ Direct False Positives: {self.stats['num_false_positives_direct']}\n")
 
-        # evaluate delay discovery
-        extended_delays, readgt, extendedreadgt = self._get_extended_delays(y)
-        percentagecorrect = self._evaluate_delay(extended_delays, TPs, receptivefield) * 100
-        print(f'Percentage of delays that are correctly discovered: {percentagecorrect} %')
+        print(f"⎡ True Positives: {self.stats['true_positives']}")
+        print(f"| False Positives: {self.stats['false_positives']}")
+        print(f"| False Negatives: {self.stats['false_negatives']}")
+        print(f"| True Positives (direct): {self.stats['true_positives_direct']}")
+        print(f"⎣ False Positives (direct): {self.stats['false_positives_direct']}\n")
+
+        print('⎡ F1 score (includes direct and indirect causal relationships):')
+        print(f"| {self.stats['f1_score']} (precision: {self.stats['precision']}, recall: {self.stats['recall']})")
+        print('|')
+        print('| F1 score (direct) (includes only direct causal relationships):')
+        print(f"⎣ {self.stats['f1_score_direct']} (precision: {self.stats['precision_direct']}, recall: {self.stats['recall_direct']})\n")
+        
+        print(f'[ Percentage of delays that are correctly discovered: {self._evaluate_delay(dataframe) * 100} %')
         print('\n============================================================\n')
 
-    def _evaluate(self, gtfile):
+    def _calculate_stats(self, dataframe):
         """Evaluates the results of TCDF by comparing it to the ground truth graph,
         and calculating precision, recall and F1-score.
         F1'-score, precision' and recall' include indirect causal relationships."""
-        extendedgtdelays, readgt, extendedreadgt = self._get_extended_delays(gtfile)
-        FP = 0
-        FPdirect = 0
-        TPdirect = 0
-        TP = 0
-        FN = 0
-        FPs = []
-        FPsdirect = []
-        TPsdirect = []
-        TPs = []
-        FNs = []
-        for key in readgt:
-            for v in self.causes[key]:
-                if v not in extendedreadgt[key]:
-                    FP += 1
-                    FPs.append((key, v))
-                else:
-                    TP += 1
-                    TPs.append((key, v))
-                if v not in readgt[key]:
-                    FPdirect += 1
-                    FPsdirect.append((key, v))
-                else:
-                    TPdirect += 1
-                    TPsdirect.append((key, v))
-            for v in readgt[key]:
-                if v not in self.causes[key]:
-                    FN += 1
-                    FNs.append((key, v))
+        gt, ext_gt, _ = self._extract_ground_truth_information(dataframe)
         
-        print("Total False Positives': ", FP)
-        print("Total True Positives': ", TP)
-        print("Total False Negatives: ", FN)
-        print("Total Direct False Positives: ", FPdirect)
-        print("Total Direct True Positives: ", TPdirect)
-        print("TPs': ", TPs)
-        print("FPs': ", FPs)
-        print("TPs direct: ", TPsdirect)
-        print("FPs direct: ", FPsdirect)
-        print("FNs: ", FNs)
-        precision = recall = 0.
 
-        if float(TP + FP) > 0:
-            precision = TP / float(TP + FP)
-        print("Precision': ", precision)
-        if float(TP + FN) > 0:
-            recall = TP / float(TP + FN)
-        print("Recall': ", recall)
-        if (precision + recall) > 0:
-            F1 = 2 * (precision * recall) / (precision + recall)
+        true_positives, false_positives, false_negatives = [], [], []
+        true_positives_direct, false_positives_direct = [], []
+        f1_score = f1_score_direct = 0
+
+        for key in gt:
+            for value in self.causes[key]:
+                if value in ext_gt[key]:
+                    true_positives.append((key, value))
+                else:
+                    false_positives.append((key, value))
+                if value in gt[key]:
+                    true_positives_direct.append((key, value))
+                else:
+                    false_positives_direct.append((key, value))
+            for value in gt[key]:
+                if value not in self.causes[key]:
+                    false_negatives.append((key, value))
+        
+        num_true_positives = len(true_positives)
+        num_false_positives = len(false_positives)
+        num_false_negatives = len(false_negatives)
+        num_true_positives_direct = len(true_positives_direct)
+        num_false_positives_direct = len(false_positives_direct)
+
+        # F1-score calculation
+        if 0 not in [num_true_positives + num_false_positives,
+                     num_true_positives + num_false_negatives]:
+            precision = num_true_positives / (num_true_positives + num_false_positives)
+            recall = num_true_positives / (num_true_positives + num_false_negatives)
+            f1_score = 2 * (precision * recall) / (precision + recall)
         else:
-            F1 = 0.
-        print("F1' score: ", F1, "(includes direct and indirect causal relationships)")
-
-        precision = recall = 0.
-        if float(TPdirect + FPdirect) > 0:
-            precision = TPdirect / float(TPdirect + FPdirect)
-        print("Precision: ", precision)
-        if float(TPdirect + FN) > 0:
-            recall = TPdirect / float(TPdirect + FN)
-        print("Recall: ", recall)
-        if (precision + recall) > 0:
-            F1direct = 2 * (precision * recall) / (precision + recall)
+            f1_score = 0
+        
+        # F1-score direct calculation
+        if 0 not in [num_true_positives_direct + num_false_positives_direct,
+                     num_true_positives_direct + num_false_negatives]:
+            precision_direct = num_true_positives_direct / (num_true_positives + num_false_positives_direct)
+            recall_direct = num_true_positives_direct / (num_true_positives_direct + num_false_negatives)
+            f1_score_direct = 2 * (precision_direct * recall_direct) / (precision_direct + recall_direct)
         else:
-            F1direct = 0.
-        print("F1 score: ", F1direct, "(includes only direct causal relationships)")
-        return FP, TP, FPdirect, TPdirect, FN, FPs, FPsdirect, TPs, TPsdirect, FNs, F1, F1direct
+            f1_score_direct = 0
+        
+        return {'num_true_positives': num_true_positives,
+                'num_false_positives': num_false_positives,
+                'num_false_negatives': num_false_negatives,
+                'num_true_positives_direct': num_true_positives_direct,
+                'num_false_positives_direct': num_false_positives_direct,
+                'true_positives': true_positives,
+                'false_positives': false_positives,
+                'false_negatives': false_negatives,
+                'true_positives_direct': true_positives_direct,
+                'false_positives_direct': false_positives_direct,
+                'f1_score': f1_score,
+                'precision': precision,
+                'recall': recall,
+                'f1_score_direct': f1_score_direct,
+                'precision_direct': precision_direct,
+                'recall_direct': recall_direct}
 
-    def _get_extended_delays(self, gtfile):
-        """Collects the total delay of indirect causal relationships."""
-        gtdata = pd.read_csv(gtfile, header=None)
+    def _extract_ground_truth_information(self, dataframe):
+        # gt — ground truth
+        # ext_gt — extended ground truth
 
-        readgt = dict()
-        effects = gtdata[1]
-        causes = gtdata[0]
-        delays = gtdata[2]
-        gtnrrelations = 0
-        pairdelays = dict()
-        for k in range(len(self.columns)):
-            readgt[k] = []
+        gt = dict((idx, []) for idx in range(len(self.columns)))
+        causes = dataframe[0]
+        effects = dataframe[1]
+
         for i in range(len(effects)):
-            key = effects[i]
-            value = causes[i]
-            readgt[key].append(value)
-            pairdelays[(key, value)] = delays[i]
-            gtnrrelations += 1
+            gt[effects[i]].append(causes[i])
 
         g = nx.DiGraph()
-        g.add_nodes_from(readgt.keys())
-        for e in readgt:
-            cs = readgt[e]
-            for c in cs:
-                g.add_edge(c, e)
+        g.add_nodes_from(gt.keys())
+        for effect in gt:
+            causes = gt[effect]
+            for cause in causes:
+                g.add_edge(cause, effect)
 
-        extendedreadgt = copy.deepcopy(readgt)
+        ext_gt = copy.deepcopy(gt)
         
         for c1 in range(len(self.columns)):
             for c2 in range(len(self.columns)):
-                paths = list(nx.all_simple_paths(g, c1, c2, cutoff=2))  # indirect path max length 3, no cycles
+                # indirect path max length 3, no cycles
+                paths = list(nx.all_simple_paths(g, c1, c2, cutoff=2))
                 
                 if len(paths) > 0:
                     for path in paths:
                         for p in path[:-1]:
-                            if p not in extendedreadgt[path[-1]]:
-                                extendedreadgt[path[-1]].append(p)
-                                
-        extendedgtdelays = dict()
-        for effect in extendedreadgt:
-            causes = extendedreadgt[effect]
+                            if p not in ext_gt[path[-1]]:
+                                ext_gt[path[-1]].append(p)
+        return gt, ext_gt, g
+
+    def _get_extended_delays(self, dataframe):
+        """Collects the total delay of indirect causal relationships."""
+        causes = dataframe[0]
+        effects = dataframe[1]
+        delays = dataframe[2]
+        pairdelays = dict(((effects[i], causes[i]), delays[i]) for i in range(len(effects)))
+        gt, ext_gt, g = self._extract_ground_truth_information(dataframe)
+
+        ext_gt_delays = dict()
+        for effect in ext_gt:
+            causes = ext_gt[effect]
             for cause in causes:
                 if (effect, cause) in pairdelays:
                     delay = pairdelays[(effect, cause)]
-                    extendedgtdelays[(effect, cause)] = [delay]
+                    ext_gt_delays[(effect, cause)] = [delay]
                 else:
                     # find extended delay
-                    paths = list(nx.all_simple_paths(g, cause, effect, cutoff=2))  # indirect path max length 3, no cycles
-                    extendedgtdelays[(effect, cause)] = []
+                    # indirect path max length 3, no cycles
+                    paths = list(nx.all_simple_paths(g, cause, effect, cutoff=2))
+                    ext_gt_delays[(effect, cause)] = []
                     for p in paths:
                         delay = 0
                         for i in range(len(p) - 1):
                             delay += pairdelays[(p[i + 1], p[i])]
-                        extendedgtdelays[(effect, cause)].append(delay)
+                        ext_gt_delays[(effect, cause)].append(delay)
 
-        return extendedgtdelays, readgt, extendedreadgt
+        return ext_gt_delays
     
-    def _evaluate_delay(self, extended_gt_delays, TPs, receptive_field):
+    def _evaluate_delay(self, dataframe):
         """Evaluates the delay discovery of TCDF by comparing the discovered
         time delays with the ground truth."""
-        zeros = 0
-        total = 0.
-        for i in range(len(TPs)):
-            tp = TPs[i]
+        ext_gt_delays = self._get_extended_delays(dataframe)
+
+        zeros = total = 0
+        for i in range(len(self.stats['true_positives'])):
+            tp = self.stats['true_positives'][i]
             discovered_delay = self.delays[tp]
-            gtdelays = extended_gt_delays[tp]
-            for d in gtdelays:
-                if d <= receptive_field:
+            gt_delays = ext_gt_delays[tp]
+            for d in gt_delays:
+                if d <= self.cnn_parameters['receptive_field']:
                     total += 1.
                     error = d - discovered_delay
                     if error == 0:
@@ -471,20 +484,19 @@ class TCDF():
                 else:
                     next
             
-        return 0. if zeros == 0 else zeros / float(total)
+        return 0. if zeros == 0 else zeros / total
 
-    # self._plotgraph(dataset_name, alldelays, columns)
-    def _plotgraph(self, stringdatafile, alldelays, columns):
+    def plotgraph(self):
         """Plots a temporal causal graph showing all discovered causal relationships
         annotated with the time delay between cause and effect."""
         G = nx.DiGraph()
-        for c in columns:
+        for c in self.columns:
             G.add_node(c)
-        for pair in alldelays:
+        for pair in self.delays:
             p1, p2 = pair
-            nodepair = (columns[p2], columns[p1])
+            nodepair = (self.columns[p2], self.columns[p1])
 
-            G.add_edges_from([nodepair], weight=alldelays[pair])
+            G.add_edges_from([nodepair], weight=self.delays[pair])
 
         edge_labels = dict([((u, v, ), d['weight'])
                             for u, v, d in G.edges(data=True)])
@@ -497,29 +509,43 @@ class TCDF():
 
         plt.show()
     
-    def visualize_weights(self, pointwise=True):
+    def visualize_weights(self, pointwise=True, attention_scores=True):
         for target, model in self.models.items():
             # layer_num = len(self.model.dwn.network)
             layer_num = self.cnn_parameters['levels'] + 1
-            fig, ax = plt.subplots(1, layer_num + int(pointwise), figsize=(5 * (layer_num + int(pointwise)), 5))
-          
+            fig, ax = plt.subplots(
+                1,
+                layer_num + int(pointwise) + int(attention_scores),
+                figsize=(5 * (layer_num + int(pointwise) + int(attention_scores) + 1), 5))
+
+            if attention_scores:
+                data = model.fs_attention.data.numpy()
+
+                ax[0].axis("off")
+                ax[0].imshow(data, cmap='viridis')
+                for (i, j), z in np.ndenumerate(data):
+                    ax[0].text(j, i, '{:0.5f}'.format(z), ha='center', va='center', color='w')
+                ax[0].set_title('Attention scores')
+            
             for layer in range(layer_num):
                 data = model.dwn.network[layer].net[0].weight.data.numpy()[:, 0, :]
 
-                ax[layer].axis("off")
-                ax[layer].imshow(data.T, cmap='viridis')
+                idx = layer + int(attention_scores)
+                ax[idx].axis("off")
+                ax[idx].imshow(data.T, cmap='viridis')
                 for (i, j), z in np.ndenumerate(data):
-                    ax[layer].text(j, i, '{:0.5f}'.format(z), ha='center', va='center', color='w')
-                ax[layer].set_title(f'Layer {layer}')
+                    ax[idx].text(j, i, '{:0.5f}'.format(z), ha='center', va='center', color='w')
+                ax[idx].set_title(f'Layer {layer}')
           
             if pointwise:
+                idx = layer_num + int(attention_scores)
                 data = model.pointwise.weight.data.numpy()[0, :, :]
 
-                ax[layer_num].axis("off")
-                ax[layer_num].imshow(data, cmap='viridis')
+                ax[idx].axis("off")
+                ax[idx].imshow(data, cmap='viridis')
                 for (i, j), z in np.ndenumerate(data):
-                    ax[layer_num].text(j, i, '{:0.5f}'.format(z), ha='center', va='center', color='w')
-                ax[layer_num].set_title('Pointwise conv')
+                    ax[idx].text(j, i, '{:0.5f}'.format(z), ha='center', va='center', color='w')
+                ax[idx].set_title('Pointwise conv')
           
             fig.suptitle(f'CNN for target: {target}')
             plt.show(fig)
