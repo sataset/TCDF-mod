@@ -464,10 +464,17 @@ class TCDF():
         
         plt.show()
     
-    def visualize_weights(self, pointwise=True, attention_scores=True, cmap='viridis'):
-        for target, model in self.models.items():
-            # layer_num = len(self.model.dwn.network)
-            layer_num = self.cnn_parameters['levels'] + 1
+    def visualize_weights(self, targets=None, pointwise=True, attention_scores=True, cmap='viridis'):
+        if targets is None:
+            targets = self.models.items()
+        else:
+            if type(targets) is str:
+                targets = [targets]
+            targets = {i: self.models[i] for i in targets}.items()
+        
+        layer_num = self.cnn_parameters['levels'] + 1
+        for target, model in targets:
+            # layer_num = len(self.models[target]depthwise)
             figsize_base = len(self.columns) + layer_num
             fig, ax = plt.subplots(
                 1,
@@ -485,7 +492,7 @@ class TCDF():
                 ax[0].set_title('Attention scores')
             
             for layer in range(layer_num):
-                data = model.dwn.network[layer].net[0].weight.detach().numpy()[:, 0, :]
+                data = model.depthwise[layer].conv1.weight.detach().numpy()[:, 0, :]
 
                 idx = layer + int(attention_scores)
                 ax[idx].axis("off")
