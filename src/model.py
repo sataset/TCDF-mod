@@ -1,88 +1,55 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
-from torch.autograd import Variable
+from torch.nn.functional import softmax
+# from torch.autograd import Variable
 
 
-# original TCDF solution
 class ADDSTCN(nn.Module):
     def __init__(self, input_size, num_levels, kernel_size, dilation_c, cuda):
         super(ADDSTCN, self).__init__()
+        
+        # num_inputs, num_levels, kernel_size=2, dilation_c=2
+        layers = []
+        in_channels = input_size
+        out_channels = input_size
+        dilation_size_last = dilation_c**(num_levels - 1)
 
-        self.dwn = DepthwiseNet(input_size, num_levels,
-                                kernel_size=kernel_size, dilation_c=dilation_c)
-        self.pointwise = nn.Conv1d(input_size, 1, 1)  # test comment
+        layers += [FirstBlock(in_channels, out_channels, kernel_size,
+                              stride=1, dilation=1,
+                              padding=(kernel_size - 1))]
+        for level in range(1, num_levels - 1):
+            dilation_size = dilation_c ** level
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size,
+                                     stride=1, dilation=dilation_size,
+                                     padding=(kernel_size - 1) * dilation_size)]
+        layers += [LastBlock(in_channels, out_channels, kernel_size,
+                             stride=1, dilation=dilation_size_last,
+                             padding=(kernel_size - 1) * dilation_size_last)]
+        self.depthwise = nn.Sequential(*layers)
 
-        self._attention = torch.ones(input_size, 1)
-        self._attention = Variable(self._attention, requires_grad=False)
+        self.pointwise = nn.Conv1d(input_size, 1, 1)  # comment
 
-        self.fs_attention = torch.nn.Parameter(self._attention.data)
+        self.fs_attention = torch.nn.Parameter(torch.ones(input_size, 1))
+        # self._attention = torch.ones(input_size, 1)
+        # self._attention = Variable(self._attention, requires_grad=False)
+        # self.fs_attention = torch.nn.Parameter(self._attention.data)
+
+        nn.init.normal_(self.pointwise.weight, mean=0.0, std=0.1)
+        # nn.init.normal_(self.pointwise.weight)
+        # nn.init.xavier_normal_(self.pointwise.weight)
+        # nn.init.kaiming_normal_(self.pointwise.weight)
 
         if cuda:
-            self.dwn = self.dwn.cuda()
-            self.pointwise = self.pointwise.cuda()  # test comment
-            self._attention = self._attention.cuda()
-
-    def init_weights(self):
-        self.pointwise.weight.data.normal_(0, 0.1)  # test comment
+            self.depthwise = self.depthwise.cuda()
+            self.pointwise = self.pointwise.cuda()  # comment
+            self.fs_attention = self.fs_attention.cuda()
+            # self._attention = self._attention.cuda()
 
     def forward(self, x):
-        y1 = self.dwn(x * F.softmax(self.fs_attention, dim=0))
-        y1 = self.pointwise(y1)  # test comment
-        return y1.transpose(1, 2)  # test comment
+        out = self.depthwise(x * softmax(self.fs_attention, dim=0))
+        out = self.pointwise(out)  # comment
+        return out.transpose(1, 2)  # comment
 
-
-# conventional convolution
-# class ADDSTCN(nn.Module):
-#     def __init__(self, input_size, num_levels, kernel_size, cuda, dilation_c):
-#         super(ADDSTCN, self).__init__()
-
-#         self.dwn = DepthwiseNet(input_size, num_levels,
-#                                 kernel_size=kernel_size, dilation_c=dilation_c)
-
-#         self._attention = torch.ones(input_size, 1)
-#         self._attention = Variable(self._attention, requires_grad=False)
-
-#         self.fs_attention = torch.nn.Parameter(self._attention.data)
-
-#         if cuda:
-#             self.dwn = self.dwn.cuda()
-#             self._attention = self._attention.cuda()
-
-#     def init_weights(self):
-#         pass
-
-#     def forward(self, x):
-#         y1 = self.dwn(x * F.softmax(self.fs_attention, dim=0))
-#         return y1
-
-
-# true pointwise implementation
-# class ADDSTCN(nn.Module):
-#     def __init__(self, input_size, num_levels, kernel_size, cuda, dilation_c):
-#         super(ADDSTCN, self).__init__()
-
-#         self.dwn = DepthwiseNet(input_size, num_levels,
-#                                 kernel_size=kernel_size, dilation_c=dilation_c)
-#         self.pointwise = nn.Conv1d(input_size, 1, 1)
-
-#         self._attention = torch.ones(input_size, 1)
-#         self._attention = Variable(self._attention, requires_grad=False)
-
-#         self.fs_attention = torch.nn.Parameter(self._attention.data)
-
-#         if cuda:
-#             self.dwn = self.dwn.cuda()
-#             self.pointwise = self.pointwise.cuda()
-#             self._attention = self._attention.cuda()
-
-#     def init_weights(self):
-#         self.pointwise.weight.data.normal_(0, 0.1)
-
-#     def forward(self, x):
-#         y1 = self.dwn(x * F.softmax(self.fs_attention, dim=0))
-#         y1 = self.pointwise(y1)
-#         return y1.transpose(1, 2)
 
 class Chomp1d(nn.Module):
     """PyTorch does not offer native support for causal convolutions,
@@ -105,19 +72,19 @@ class FirstBlock(nn.Module):
         self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
                                stride=stride, padding=padding,
                                dilation=dilation, groups=n_outputs)
-
         self.chomp1 = Chomp1d(padding)
-        self.net = nn.Sequential(self.conv1, self.chomp1)
         self.relu = nn.PReLU(n_inputs)
-        self.init_weights()
-
-    def init_weights(self):
-        """Initialize weights"""
-        self.conv1.weight.data.normal_(0, 0.1)
+        
+        nn.init.normal_(self.conv1.weight, mean=0.0, std=0.1)
+        # nn.init.normal_(self.conv1.weight)
+        # nn.init.xavier_normal_(self.conv1.weight)
+        # nn.init.kaiming_normal_(self.conv1.weight)
 
     def forward(self, x):
-        out = self.net(x)
-        return self.relu(out)
+        out = self.conv1(x)
+        out = self.chomp1(out)
+        out = self.relu(out)
+        return out
 
 
 class TemporalBlock(nn.Module):
@@ -127,20 +94,19 @@ class TemporalBlock(nn.Module):
         self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
                                stride=stride, padding=padding,
                                dilation=dilation, groups=n_outputs)
-
         self.chomp1 = Chomp1d(padding)
-        self.net = nn.Sequential(self.conv1, self.chomp1)
         self.relu = nn.PReLU(n_inputs)
-        self.init_weights()
 
-    def init_weights(self):
-        """Initialize weights"""
-        self.conv1.weight.data.normal_(0, 0.1)
-        
+        nn.init.normal_(self.conv1.weight, mean=0.0, std=0.1)
+        # nn.init.normal_(self.conv1.weight)
+        # nn.init.xavier_normal_(self.conv1.weight)
+        # nn.init.kaiming_normal_(self.conv1.weight)
 
     def forward(self, x):
-        out = self.net(x)
-        return self.relu(out + x)  # residual connection
+        out = self.conv1(x)
+        out = self.chomp1(out)
+        out = self.relu(out + x)  # residual connection
+        return out
 
 
 class LastBlock(nn.Module):
@@ -150,47 +116,24 @@ class LastBlock(nn.Module):
         self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, groups=n_outputs,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
-        self.net = nn.Sequential(self.conv1, self.chomp1)
         self.linear = nn.Linear(n_inputs, n_inputs)
-        self.init_weights()
-
-    def init_weights(self):
-        """Initialize weights"""
-        self.linear.weight.data.normal_(0, 0.01)
+        
+        nn.init.normal_(self.conv1.weight, mean=0.0, std=0.1)
+        # nn.init.normal_(self.conv1.weight)
+        # nn.init.xavier_normal_(self.conv1.weight)
+        # nn.init.kaiming_normal_(self.conv1.weight)
 
     def forward(self, x):
-        out = self.net(x)
+        out = self.conv1(x)
+        out = self.chomp1(out)
 
         # original TCDF solution
-        return self.linear(out.transpose(1, 2) + x.transpose(1, 2)).transpose(1, 2)
+        out = self.linear(out.transpose(1, 2) + x.transpose(1, 2)).transpose(1, 2)
 
         # test
-        # return self.linear((out + x).transpose(1, 2))
+        # out = self.linear((out + x).transpose(1, 2))
         
         # true pointwise conv
-        # return (out + x)
+        # out = (out + x)
 
-
-class DepthwiseNet(nn.Module):
-    def __init__(self, num_inputs, num_levels, kernel_size=2, dilation_c=2):
-        super(DepthwiseNet, self).__init__()
-        layers = []
-        in_channels = num_inputs
-        out_channels = num_inputs
-        dilation_size_last = dilation_c**(num_levels - 1)
-
-        layers += [FirstBlock(in_channels, out_channels, kernel_size,
-                              stride=1, dilation=1,
-                              padding=(kernel_size - 1))]
-        for level in range(1, num_levels - 1):
-            dilation_size = dilation_c ** level
-            layers += [TemporalBlock(in_channels, out_channels, kernel_size,
-                                     stride=1, dilation=dilation_size,
-                                     padding=(kernel_size - 1) * dilation_size)]
-        layers += [LastBlock(in_channels, out_channels, kernel_size,
-                             stride=1, dilation=dilation_size_last,
-                             padding=(kernel_size - 1) * dilation_size_last)]
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.network(x)
+        return out
