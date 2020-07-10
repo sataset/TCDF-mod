@@ -59,16 +59,17 @@ class TCDF():
         Random seed
     """
     def __init__(self,
+                 significance=0.8,
+                 intervention='perm',
                  cuda=False,
                  epochs=1000,
                  kernel_size=4,
                  hidden_layers=0,
                  dilation_coefficient=4,
-                 significance=0.8,
                  learning_rate=0.01,
                  optimizer='Adam',
                  log_interval=500,
-                 seed=1111):
+                 seed=0):
         if torch.cuda.is_available():
             if not cuda:
                 print('WARNING: You have a CUDA device, you should probably run\n\
@@ -83,21 +84,24 @@ class TCDF():
         for level in range(0, hidden_layers + 1):
             receptive_field += (kernel_size - 1) * dilation_coefficient**(level)
         
-        self.cnn_parameters = {'cuda': cuda,
-                               'num_epochs': epochs,
-                               'kernel_size': kernel_size,
-                               'levels': hidden_layers + 1,
-                               'dilation_c': dilation_coefficient,
-                               'receptive_field': receptive_field,
-                               'significance': significance,
-                               'learning_rate': learning_rate,
-                               'optimizer': optimizer,
-                               'log_interval': log_interval,
-                               'seed': seed}
+        self.parameters = {
+            'significance': significance,
+            'intervention': intervention,
+            'cuda': cuda,
+            'num_epochs': epochs,
+            'kernel_size': kernel_size,
+            'levels': hidden_layers + 1,
+            'dilation_c': dilation_coefficient,
+            'receptive_field': receptive_field,
+            'learning_rate': learning_rate,
+            'optimizer': optimizer,
+            'log_interval': log_interval,
+            'seed': seed
+        }
         self.models = None
         self.verbose = None
     
-    def fit(self, X, normalize='std', verbose=None):
+    def fit(self, X, normalize=None, verbose=None):
         """Loops through all variables in a dataset and return the discovered
         causes, time delays, losses, attention scores and variable names."""
         self.models = {}
@@ -111,6 +115,8 @@ class TCDF():
             X = (X - X.mean()) / X.std()
         elif normalize == 'minmax':
             X = (X - X.min()) / (X.max() - X.min())
+        elif normalize is not None:
+            print(f'\nUnspecified normalization provided: {normalize}\n')
         
         self.causes = dict()
         self.delays = dict()
@@ -135,43 +141,44 @@ class TCDF():
             print('\nAnalysis started for target: ', target)
         
         # => Step 1: Preparing datasets and creating CNN with given parameters
-        torch.manual_seed(self.cnn_parameters['seed'])
+        torch.manual_seed(self.parameters['seed'])
         
         X_train, Y_train = self._prepare_data(dataframe, target)
-        X_train = X_train.unsqueeze(0).contiguous()
-        Y_train = Y_train.unsqueeze(2).contiguous()
-
-        input_channels = X_train.size()[1]
-            
-        self.models[target] = ADDSTCN(
-            input_size=input_channels,
-            num_levels=self.cnn_parameters['levels'],
-            kernel_size=self.cnn_parameters['kernel_size'],
-            dilation_c=self.cnn_parameters['dilation_c'],
-            cuda=self.cnn_parameters['cuda'])
         
-        if self.cnn_parameters['cuda']:
+        # torch.Size([4, 1000]) torch.Size([1, 1000])
+        X_train = X_train.unsqueeze(0).contiguous()
+        Y_train = Y_train.unsqueeze(0).contiguous()
+
+        self.models[target] = ADDSTCN(
+            in_channels=X_train.size()[1],
+            num_levels=self.parameters['levels'],
+            kernel_size=self.parameters['kernel_size'],
+            dilation_c=self.parameters['dilation_c'])
+        
+        if self.parameters['cuda']:
             self.models[target].cuda()
             X_train = X_train.cuda()
             Y_train = Y_train.cuda()
 
-        optimizer = getattr(torch.optim, self.cnn_parameters['optimizer'])(self.models[target].parameters(),
-                                                                           lr=self.cnn_parameters['learning_rate'])
+        optimizer = getattr(torch.optim, self.parameters['optimizer'])(
+            self.models[target].parameters(),
+            lr=self.parameters['learning_rate'])
         
         # => Step 2: Train CNN
         self.models[target].eval()
         first_loss = mse_loss(self.models[target](X_train), Y_train)
         first_loss = first_loss.cpu().detach().item()
         
-        for epoch in range(1, self.cnn_parameters['num_epochs'] + 1):
+        for epoch in range(1, self.parameters['num_epochs'] + 1):
             scores, real_loss = self._train(self.models[target], optimizer, X_train, Y_train, epoch)
         real_loss = real_loss.cpu().detach().item()
         
         # => Step 3: Attention interpretation
         # to find tau, threshold distinguishes potential causes
         # from non-causal time series
-        s = sorted(scores.view(-1).cpu().detach().numpy(), reverse=True)
-        indices = np.argsort(-1 * scores.view(-1).cpu().detach().numpy())
+        scores = scores.view(-1).cpu().detach().numpy()
+        s = sorted(scores, reverse=True)
+        indices = np.argsort(-1 * scores)
         
         if len(s) <= 5:
             potentials = []
@@ -186,11 +193,11 @@ class TCDF():
                     break
                 gap = s[i] - s[i + 1]
                 gaps.append(gap)
-            sortgaps = sorted(gaps, reverse=True)
+            sort_gaps = sorted(gaps, reverse=True)
             
             for i in range(0, len(gaps)):
-                largestgap = sortgaps[i]
-                index = gaps.index(largestgap)
+                largest_gap = sort_gaps[i]
+                index = gaps.index(largest_gap)
                 ind = -1
                 if index < ((len(s) - 1) / 2):  # gap should be in first half
                     if index > 0:
@@ -207,18 +214,20 @@ class TCDF():
         
         # => Step 4: Validate potential causes
         # Apply PIVM (permutes the values) to check if potential cause is true cause
+        print('\n')
         for idx in potentials:
-            # zeros instead of intervention
-            # X_test2 = np.zeros(X_train.shape)
-            # shuffled = torch.from_numpy(X_test2).float()
-            
-            # original TCDF solution
-            random.seed(self.cnn_parameters['seed'])
-            X_test2 = X_train.clone().cpu().numpy()
-            random.shuffle(X_test2[:, idx, :][0])
-            shuffled = torch.from_numpy(X_test2)
+            if self.parameters['intervention'] == 'zeros':
+                X_intervened = np.zeros(X_train.shape)
+                shuffled = torch.from_numpy(X_intervened).float()
+            elif self.parameters['intervention'] == 'perm':
+                random.seed(self.parameters['seed'])
+                X_intervened = X_train.clone().cpu().numpy()
+                random.shuffle(X_intervened[:, idx, :][0])
+                shuffled = torch.from_numpy(X_intervened)
+            else:
+                raise ValueError(f"Unspecified intervention provided: {self.parameters['intervention']}")
 
-            if self.cnn_parameters['cuda']:
+            if self.parameters['cuda']:
                 shuffled = shuffled.cuda()
             self.models[target].eval()
             output = self.models[target](shuffled)
@@ -229,150 +238,174 @@ class TCDF():
             testdiff = first_loss - test_loss
 
             if self.verbose == 2:
-                print('\n⎡ diff = first_loss - real_loss')
-                print(f'| {diff} = {first_loss} - {real_loss}')
-                print('|')
-                print('| testdiff = first_loss - test_loss')
-                print(f'⎣ {testdiff} = {first_loss} - {test_loss}\n')
+                lines = ['diff = first_loss - real_loss',
+                         f'{diff} = {first_loss} - {real_loss}',
+                         '',
+                         'testdiff = first_loss - test_loss',
+                         f'{testdiff} = {first_loss} - {test_loss}']
+                self.bracket_print(lines)
+                print('\n')
 
-            if testdiff > (diff * self.cnn_parameters['significance']):
+            if testdiff > (diff * self.parameters['significance']):
                 validated.remove(idx)
         
         # => Step 5: Delay discovery
-        weights = []
-        
         # Discover time delay between cause and effect
         # by interpreting kernel weights
-        for layer in range(self.cnn_parameters['levels']):
-            shapes = self.models[target].depthwise[layer].conv1.weight.size()
-            weight = self.models[target].depthwise[layer].conv1.weight.abs().view(shapes[0], shapes[2])
-            weights.append(weight)
+        weights = [self.models[target].network[layer].conv.weight.detach().abs().numpy()[:, 0, :]
+                   for layer in range(self.parameters['levels'])]
 
         delays = dict()
         target_idx = dataframe.columns.get_loc(target)
         for v in validated:
-            totaldelay = 0
+            total_delay = 0
             for k in range(len(weights)):
-                w = weights[k]
-                row = w[v]
-                twolargest = heapq.nlargest(2, row)
-                m = twolargest[0]
-                m2 = twolargest[1]
-                if m > m2:
-                    index_max = len(row) - 1 - max(range(len(row)), key=row.__getitem__)
-                else:
-                    # take first filter
-                    index_max = 0
-                delay = index_max * (self.cnn_parameters['dilation_c']**k)
-                totaldelay += delay
-            if target_idx != v:
-                delays[(target_idx, v)] = totaldelay
-            else:
-                delays[(target_idx, v)] = totaldelay + 1
+                # take validated weights row
+                row = weights[k][v]
+                row_len = len(row)
+
+                max_indices = [i for i, j in enumerate(row) if j == max(row)]
+                if len(max_indices) > 1:
+                    max_indices = [row_len - 1]
+                index_max = row_len - 1 - max_indices[0]
+                
+                delay = index_max * (self.parameters['dilation_c']**k)
+                total_delay += delay
+            delays[(v, target_idx)] = total_delay + int(target_idx == v)
         if self.verbose >= 1:
             print(f'Validated causes: {validated}')
         
-        return validated, delays, real_loss, scores.view(-1).cpu().detach().numpy().tolist()
+        return validated, delays, real_loss, scores.tolist()
     
     def _prepare_data(self, dataframe, target):
         """Reads data from csv file and transforms it to two PyTorch tensors:
         dataset x and target time series y that has to be predicted."""
         df_y = dataframe.copy(deep=True)[[target]]
         df_x = dataframe.copy(deep=True)
-        df_y_shift = df_y.copy(deep=True).shift(periods=1, axis=0)
-        df_y_shift[target] = df_y_shift[target].fillna(0.)
+
+        df_y_shift = df_y.copy(deep=True).shift(periods=1, axis=0).fillna(0.)
+        
+        # df_y_shift = df_y.copy(deep=True)
+        # df_y_shift.iloc[-1] = 0
+        
         df_x[target] = df_y_shift
+        
         data_x = df_x.values.astype('float32').transpose()
         data_y = df_y.values.astype('float32').transpose()
         data_x = torch.from_numpy(data_x)
         data_y = torch.from_numpy(data_y)
 
         return data_x, data_y
-        # x, y = Variable(data_x), Variable(data_y)
-        # return x, y
     
     def _train(self, model, optimizer, train_data, train_target, epoch):
         """Trains model by performing one epoch and returns attention scores and loss."""
 
         model.train()
-        x, y = train_data[0:1], train_target[0:1]
-            
+        if train_data.shape[0] == 1 and train_target.shape[0] == 1:
+            x, y = train_data, train_target
+        else:
+            raise ValueError('Batch size is not equal to 1.')
+
         optimizer.zero_grad()
         output = model(x)
-        
+
         loss = mse_loss(output, y)
         loss.backward()
         optimizer.step()
 
-        if self.verbose == 2 and (epoch % self.cnn_parameters['log_interval'] == 0
-                                  or epoch % self.cnn_parameters['num_epochs'] == 0
+        if self.verbose == 2 and (epoch % self.parameters['log_interval'] == 0
+                                  or epoch % self.parameters['num_epochs'] == 0
                                   or epoch == 1):
             print('Epoch: {:2d} [{:.0f}%] \tLoss: {:.6f}'.format(
-                epoch, epoch / self.cnn_parameters['num_epochs'] * 100, loss))
+                epoch, epoch / self.parameters['num_epochs'] * 100, loss))
 
         return model.fs_attention.detach(), loss
     
-    def get_causes(self):
+    def get_causes(self, graphical=False):
         print('\n========================== RESULTS =========================\n')
-        for pair in self.delays:
-            print(f'{self.columns[pair[1]]} causes {self.columns[pair[0]]} '
-                  + f'with a delay of {self.delays[pair]} time steps.')
+        if graphical:
+            for pair in self.delays:
+                print(f'{self.columns[pair[0]]} ---> {self.columns[pair[1]]} (d = {self.delays[pair]})')
+        else:
+            for pair in self.delays:
+                print('{} causes {} with a delay of {} time steps.'
+                      .format(self.columns[pair[0]],
+                              self.columns[pair[1]],
+                              self.delays[pair]))
         print('\n============================================================\n')
 
-    def check_with_ground_truth(self, y, normalize=True):
+    @staticmethod
+    def bracket_print(lines, bracket_type='['):
+        brackets = {'[': ['⎡', '|', '⎣'],
+                    '(': ['⎧', '|', '⎩']}[bracket_type]
+        magic = len(lines) - 2
+        bracket = f'{bracket_type}' * (-magic) \
+                  + f'{brackets[0]}' \
+                  + f'{brackets[1]}' * (magic) \
+                  + f'{brackets[2]}'
+        for b, l in zip(bracket, lines):
+            print(b, l)
+    
+    def check_with_ground_truth(self, y):
         """Evaluate TCDF by comparing discovered causes with ground truth"""
         if type(y) is str:
-            y = pd.read_csv(y)
+            with open(y) as f:
+                if f.readline() == 'cause,effect,delay\n':
+                    y = pd.read_csv(y)
+                else:
+                    y = pd.read_csv(y, names=['cause', 'effect', 'delay'])
 
         self.stats = self._calculate_stats(y)
+
         print('\n======================== EVALUATION ========================\n')
-        print(f"⎡ Total connections: {self.stats['Total connections']}")
-        print('|')
-        print(f"| Correct connections: {self.stats['Correct connections']}")
-        print(f"| Incorrect connections: {self.stats['Incorrect connections'][0], self.stats['Incorrect connections'][1]}")
-        print(f"| Incorrect directions: {self.stats['Incorrect directions'][0], self.stats['Incorrect directions'][1]}")
-        print(f"⎣ Undetected connections: {self.stats['Undetected connections'][0], self.stats['Undetected connections'][1]}\n")
-
-        print('⎡ Delays')
-        print(f"|   Correct: {self.stats['Delays']['Correct']}")
-        print(f"|   Incorrect AND correct direction: {self.stats['Delays']['Incorrect AND correct direction']}")
-        print(f"⎣   Correct AND incorrect direction: {self.stats['Delays']['Correct AND incorrect direction']}\n")
-
+        lines_1 = [f'{k}: {v}' for k, v in self.stats.items() if k != 'Delays']
+        lines_1.insert(1, '')
+        lines_2 = ['Delays', ''] + [f'{k}: {v}' for k, v in self.stats['Delays'].items()]
+        
+        self.bracket_print(lines_1)
+        print('\n')
+        self.bracket_print(lines_2)
         print('\n============================================================\n')
 
     def _calculate_stats(self, dataframe):
         """Evaluates the results of TCDF by comparing it to the ground truth graph.
         """
-        num_connections = len(dataframe)
-        gt_np = dataframe.to_numpy()
+        num_directions = len(dataframe)
+        gt = list(zip(dataframe['cause'],
+                      dataframe['effect'],
+                      dataframe['delay']))
         gt_connections = [(dataframe['cause'][i], dataframe['effect'][i])
-                          for i in range(num_connections)]
+                          for i in range(num_directions)]
 
         stats = {}
-        stats['Total connections'] = num_connections
+        stats['Total directions'] = num_directions
         stats['Correct connections'] = 0
+        stats['Correct directions'] = 0
         stats['Incorrect connections'] = [0, set()]
         stats['Incorrect directions'] = [0, set()]
         stats['Undetected connections'] = [0, set()]
 
         stats['Delays'] = {}
         stats['Delays']['Correct'] = 0
-        stats['Delays']['Incorrect AND correct direction'] = 0
-        stats['Delays']['Correct AND incorrect direction'] = 0
+        stats['Delays']['Incorrect AND correct direction'] = [0, set()]
+        stats['Delays']['Correct AND incorrect direction'] = [0, set()]
 
-        for c, e, d in gt_np:
-            if (c, e) in self.delays:
+        for c, e, d in gt:
+            if (c, e) in self.delays or (e, c) in self.delays:
                 stats['Correct connections'] += 1
-                if self.delays[(c, e)] == d:
-                    stats['Delays']['Correct'] += 1
-                else:
-                    stats['Delays']['Incorrect AND correct direction'] += 1
-            elif (e, c) in self.delays:
-                stats['Correct connections'] += 1
-                stats['Incorrect directions'][1].add((c, e))
-                if self.delays[(e, c)] == d:
-                    stats['Delays']['Correct'] += 1
-                    stats['Delays']['Correct AND incorrect direction'] += 1
+                if (c, e) in self.delays:
+                    stats['Correct directions'] += 1
+                    if self.delays[(c, e)] == d:
+                        stats['Delays']['Correct'] += 1
+                    else:
+                        stats['Delays']['Incorrect AND correct direction'][0] += 1
+                        stats['Delays']['Incorrect AND correct direction'][1].add((c, e))
+                if e != c and (e, c) in self.delays:
+                    stats['Incorrect directions'][1].add((c, e))
+                    if self.delays[(e, c)] == d:
+                        stats['Delays']['Correct'] += 1
+                        stats['Delays']['Correct AND incorrect direction'][0] += 1
+                        stats['Delays']['Correct AND incorrect direction'][1].add((c, e))
             else:
                 stats['Undetected connections'][1].add((c, e))
 
@@ -404,7 +437,7 @@ class TCDF():
             G.add_node(nodes[idx])
         for pair in self.delays:
             p1, p2 = pair
-            nodepair = (nodes[p2], nodes[p1])
+            nodepair = (nodes[p1], nodes[p2])
 
             G.add_edges_from([nodepair], weight=self.delays[pair])
 
@@ -443,7 +476,7 @@ class TCDF():
                 G.add_node(nodes[idx])
             for pair in delays:
                 p1, p2 = pair
-                nodepair = (nodes[p2], nodes[p1])
+                nodepair = (nodes[p1], nodes[p2])
 
                 G.add_edges_from([nodepair], weight=delays[pair])
 
@@ -464,7 +497,12 @@ class TCDF():
         
         plt.show()
     
-    def visualize_weights(self, targets=None, pointwise=True, attention_scores=True, cmap='viridis'):
+    def visualize_weights(self,
+                          targets=None,
+                          pointwise=True,
+                          attention_scores=True,
+                          absolute=False,
+                          cmap='viridis'):
         if targets is None:
             targets = self.models.items()
         else:
@@ -472,14 +510,18 @@ class TCDF():
                 targets = [targets]
             targets = {i: self.models[i] for i in targets}.items()
         
-        layer_num = self.cnn_parameters['levels'] + 1
+        layer_num = self.parameters['levels']
         for target, model in targets:
             # layer_num = len(self.models[target]depthwise)
             figsize_base = len(self.columns) + layer_num
             fig, ax = plt.subplots(
                 1,
                 layer_num + int(pointwise) + int(attention_scores),
-                figsize=(figsize_base * (layer_num + int(pointwise) + int(attention_scores) + 1), figsize_base))
+                figsize=(figsize_base * (layer_num
+                                         + int(pointwise)
+                                         + int(attention_scores)
+                                         + 1),
+                         figsize_base))
 
             if attention_scores:
                 data = model.fs_attention.detach().numpy()
@@ -492,8 +534,10 @@ class TCDF():
                 ax[0].set_title('Attention scores')
             
             for layer in range(layer_num):
-                data = model.depthwise[layer].conv1.weight.detach().numpy()[:, 0, :]
-
+                data = model.network[layer].conv.weight.detach().numpy()[:, 0, :]
+                if absolute:
+                    data = abs(data)
+                
                 idx = layer + int(attention_scores)
                 ax[idx].axis("off")
                 ax[idx].imshow(data, cmap=cmap)
@@ -505,6 +549,8 @@ class TCDF():
             if pointwise:
                 idx = layer_num + int(attention_scores)
                 data = model.pointwise.weight.detach().numpy()[0, :, :]
+                if absolute:
+                    data = abs(data)
 
                 ax[idx].axis("off")
                 ax[idx].imshow(data, cmap=cmap)
