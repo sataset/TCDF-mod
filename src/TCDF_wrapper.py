@@ -1,10 +1,8 @@
 import torch
 import torch.optim
 from torch.nn.functional import mse_loss
-# from torch.autograd import Variable
 from model import ADDSTCN
 import random
-import heapq
 import pandas as pd
 import numpy as np
 import networkx as nx
@@ -145,7 +143,6 @@ class TCDF():
         
         X_train, Y_train = self._prepare_data(dataframe, target)
         
-        # torch.Size([4, 1000]) torch.Size([1, 1000])
         X_train = X_train.unsqueeze(0).contiguous()
         Y_train = Y_train.unsqueeze(0).contiguous()
 
@@ -284,9 +281,6 @@ class TCDF():
         df_x = dataframe.copy(deep=True)
 
         df_y_shift = df_y.copy(deep=True).shift(periods=1, axis=0).fillna(0.)
-        
-        # df_y_shift = df_y.copy(deep=True)
-        # df_y_shift.iloc[-1] = 0
         
         df_x[target] = df_y_shift
         
@@ -512,7 +506,6 @@ class TCDF():
         
         layer_num = self.parameters['levels']
         for target, model in targets:
-            # layer_num = len(self.models[target]depthwise)
             figsize_base = len(self.columns) + layer_num
             fig, ax = plt.subplots(
                 1,
